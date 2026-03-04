@@ -13,6 +13,45 @@ from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font
 from openpyxl.utils.cell import range_boundaries
 
+# 엑셀 COM 연동 (Windows, pywin32 필요). 실패 시 GUI에서 버튼 비활성화.
+try:
+    import win32com.client
+    _EXCEL_COM_AVAILABLE = True
+except Exception:
+    win32com = None  # type: ignore
+    _EXCEL_COM_AVAILABLE = False
+
+
+def _excel_open_file(abs_path: str, app=None):
+    """엑셀 프로그램으로 파일을 열고 (app, wb) 반환. app이 있으면 같은 인스턴스에 추가로 열기."""
+    if not _EXCEL_COM_AVAILABLE:
+        raise RuntimeError("엑셀 연동을 사용하려면 pywin32가 필요합니다. pip install pywin32")
+    abs_path = os.path.abspath(abs_path)
+    if not os.path.exists(abs_path):
+        raise FileNotFoundError(abs_path)
+    if app is None:
+        app = win32com.client.Dispatch("Excel.Application")
+        app.Visible = True
+    wb = app.Workbooks.Open(abs_path)
+    return app, wb
+
+
+def _excel_get_selection(app, wb) -> Tuple[str, str]:
+    """활성 시트명과 선택 영역 주소(예: B2:B200) 반환. $ 제거. 복수 영역이면 첫 영역만 사용."""
+    if not app or not wb:
+        raise RuntimeError("먼저 '엑셀에서 열기'로 파일을 열어 주세요.")
+    try:
+        wb.Activate()
+        sheet_name = str(app.ActiveSheet.Name)
+        sel = app.Selection
+        # win32com에서는 Address가 인자 없이 프로퍼티로 노출됨. $는 제거.
+        addr = str(sel.Address).replace("$", "")
+        if "," in addr:
+            addr = addr.split(",")[0].strip()
+        return sheet_name, addr
+    except Exception as e:
+        raise RuntimeError(f"엑셀 선택을 가져오지 못했습니다: {e}") from e
+
 
 Key = Tuple[str, str]  # (coord, material)
 
@@ -26,6 +65,7 @@ class SheetData:
     coord_to_count: Dict[str, int] = field(default_factory=dict)
     coord_to_rows: Dict[str, List[int]] = field(default_factory=dict)
     coord_to_material_counts: Dict[str, Dict[str, int]] = field(default_factory=dict)
+    material_to_qty: Dict[str, float] = field(default_factory=dict)  # 자재명별 총수량 (자재명 기준 매칭용)
 
 
 def norm_text(v: object, *, case_insensitive: bool) -> str:
@@ -145,6 +185,8 @@ def build_sheet_data(
                 sd.key_to_qty[key] = sd.key_to_qty.get(key, 0.0) + qty
                 add_row_list(sd.key_to_rows, key, row_num)
 
+    for (_c, mat), q in sd.key_to_qty.items():
+        sd.material_to_qty[mat] = sd.material_to_qty.get(mat, 0.0) + q
     return sd
 
 
@@ -217,6 +259,7 @@ def run_match(config: dict) -> str:
     opts = config.get("options", {})
     inplace = bool(opts.get("inplace", False))
     case_insensitive = bool(opts.get("case_insensitive", False))
+    material_only_match = bool(opts.get("material_only_match", True))  # 자재명 기준, TOP+BOT 총수량과 BOM 매칭
     output_path = config.get("output_path") or ""
 
     bom_cfg = config["bom"]
@@ -286,93 +329,116 @@ def run_match(config: dict) -> str:
             case_insensitive=case_insensitive,
         )
 
-    all_keys = set(bom.key_to_qty) | set(top.key_to_qty) | set(bot.key_to_qty)
-
-    match_rows = []
-    unmatched_top_rows = []
-    unmatched_bot_rows = []
-    ok_count = 0
-    unmatched_top_count = 0
-    unmatched_bot_count = 0
-
-    for coord, mat in sorted(all_keys):
-        in_b = (coord, mat) in bom.key_to_qty
-        in_t = (coord, mat) in top.key_to_qty
-        in_bo = (coord, mat) in bot.key_to_qty
-
-        q_b = bom.key_to_qty.get((coord, mat), 0.0)
-        q_t = top.key_to_qty.get((coord, mat), 0.0)
-        q_bo = bot.key_to_qty.get((coord, mat), 0.0)
-        q_tb = q_t + q_bo
-
-        status = compute_status(in_b, (in_t or in_bo), q_b, q_tb)
-        status_top = compute_status(in_b, in_t, q_b, q_t)
-        status_bot = compute_status(in_b, in_bo, q_b, q_bo)
-        key_str = f"{coord}|{mat}"
-
-        row = [
-            key_str, coord, mat, q_b, q_t, q_bo, q_tb,
-            "Y" if in_b else "", "Y" if in_t else "", "Y" if in_bo else "",
-            status,
-        ]
-        match_rows.append(row)
-
-        if status == "OK":
-            ok_count += 1
-        if status_top != "OK" and (in_b or in_t):
-            unmatched_top_count += 1
-            unmatched_top_rows.append([
-                key_str, coord, mat, q_b, q_t,
-                "Y" if in_b else "", "Y" if in_t else "", status_top,
-            ])
-        if status_bot != "OK" and (in_b or in_bo):
-            unmatched_bot_count += 1
-            unmatched_bot_rows.append([
-                key_str, coord, mat, q_b, q_bo,
-                "Y" if in_b else "", "Y" if in_bo else "", status_bot,
-            ])
-
-    ws_match = ensure_fresh_sheet(wb, "Match_Result")
-    write_table(
-        ws_match,
-        headers=[
+    if material_only_match:
+        # 자재명 기준: BOM 수량 vs TOP+BOT 총수량 매칭 (좌표는 TOP/BOT에 나뉘어 있어도 자재별 합으로 비교)
+        all_materials = set(bom.material_to_qty) | set(top.material_to_qty) | set(bot.material_to_qty)
+        match_rows = []
+        unmatched_top_rows = []
+        unmatched_bot_rows = []
+        ok_count = 0
+        unmatched_top_count = 0
+        unmatched_bot_count = 0
+        for mat in sorted(all_materials):
+            q_b = bom.material_to_qty.get(mat, 0.0)
+            q_t = top.material_to_qty.get(mat, 0.0)
+            q_bo = bot.material_to_qty.get(mat, 0.0)
+            q_tb = q_t + q_bo
+            in_b = mat in bom.material_to_qty
+            in_t = mat in top.material_to_qty
+            in_bo = mat in bot.material_to_qty
+            status = compute_status(in_b, (in_t or in_bo), q_b, q_tb)
+            status_top = compute_status(in_b, in_t, q_b, q_t)
+            status_bot = compute_status(in_b, in_bo, q_b, q_bo)
+            row = [
+                mat, q_b, q_t, q_bo, q_tb,
+                "Y" if in_b else "", "Y" if in_t else "", "Y" if in_bo else "",
+                status,
+            ]
+            match_rows.append(row)
+            if status == "OK":
+                ok_count += 1
+            if status_top != "OK" and (in_b or in_t):
+                unmatched_top_count += 1
+                unmatched_top_rows.append([mat, q_b, q_t, "Y" if in_b else "", "Y" if in_t else "", status_top])
+            if status_bot != "OK" and (in_b or in_bo):
+                unmatched_bot_count += 1
+                unmatched_bot_rows.append([mat, q_b, q_bo, "Y" if in_b else "", "Y" if in_bo else "", status_bot])
+        match_headers = ["Material", "BOM_Qty", "TOP_Qty", "BOT_Qty", "TOP+BOT_Qty", "In_BOM", "In_TOP", "In_BOT", "Status"]
+        un_headers = ["Material", "BOM_Qty", "TOP_Qty", "BOT_Qty", "TOP+BOT_Qty", "Status"]
+        un_top_headers = ["Material", "BOM_Qty", "TOP_Qty", "In_BOM", "In_TOP", "Status"]
+        un_bot_headers = ["Material", "BOM_Qty", "BOT_Qty", "In_BOM", "In_BOT", "Status"]
+        unmatched_rows = [r[:5] + [r[8]] for r in match_rows if r[8] != "OK"]
+    else:
+        # 좌표+자재 기준 (기존): (coord, material) 키별 매칭
+        all_keys = set(bom.key_to_qty) | set(top.key_to_qty) | set(bot.key_to_qty)
+        match_rows = []
+        unmatched_top_rows = []
+        unmatched_bot_rows = []
+        ok_count = 0
+        unmatched_top_count = 0
+        unmatched_bot_count = 0
+        for coord, mat in sorted(all_keys):
+            in_b = (coord, mat) in bom.key_to_qty
+            in_t = (coord, mat) in top.key_to_qty
+            in_bo = (coord, mat) in bot.key_to_qty
+            q_b = bom.key_to_qty.get((coord, mat), 0.0)
+            q_t = top.key_to_qty.get((coord, mat), 0.0)
+            q_bo = bot.key_to_qty.get((coord, mat), 0.0)
+            q_tb = q_t + q_bo
+            status = compute_status(in_b, (in_t or in_bo), q_b, q_tb)
+            status_top = compute_status(in_b, in_t, q_b, q_t)
+            status_bot = compute_status(in_b, in_bo, q_b, q_bo)
+            key_str = f"{coord}|{mat}"
+            row = [
+                key_str, coord, mat, q_b, q_t, q_bo, q_tb,
+                "Y" if in_b else "", "Y" if in_t else "", "Y" if in_bo else "",
+                status,
+            ]
+            match_rows.append(row)
+            if status == "OK":
+                ok_count += 1
+            if status_top != "OK" and (in_b or in_t):
+                unmatched_top_count += 1
+                unmatched_top_rows.append([
+                    key_str, coord, mat, q_b, q_t,
+                    "Y" if in_b else "", "Y" if in_t else "", status_top,
+                ])
+            if status_bot != "OK" and (in_b or in_bo):
+                unmatched_bot_count += 1
+                unmatched_bot_rows.append([
+                    key_str, coord, mat, q_b, q_bo,
+                    "Y" if in_b else "", "Y" if in_bo else "", status_bot,
+                ])
+        match_headers = [
             "Key(coord|material)", "Coord", "Material",
             "BOM_Qty", "TOP_Qty", "BOT_Qty", "TOP+BOT_Qty",
             "In_BOM", "In_TOP", "In_BOT", "Status",
-        ],
-        rows=match_rows,
-    )
-
-    unmatched_rows = [r[:7] + [r[10]] for r in match_rows if r[10] != "OK"]
-    ws_un = ensure_fresh_sheet(wb, "Unmatched")
-    write_table(
-        ws_un,
-        headers=[
+        ]
+        un_headers = [
             "Key(coord|material)", "Coord", "Material",
             "BOM_Qty", "TOP_Qty", "BOT_Qty", "TOP+BOT_Qty", "Status",
-        ],
-        rows=unmatched_rows,
-    )
-
-    ws_un_top = ensure_fresh_sheet(wb, "Unmatched_TOP")
-    write_table(
-        ws_un_top,
-        headers=[
+        ]
+        un_top_headers = [
             "Key(coord|material)", "Coord", "Material",
             "BOM_Qty", "TOP_Qty", "In_BOM", "In_TOP", "Status",
-        ],
-        rows=unmatched_top_rows,
-    )
-
-    ws_un_bot = ensure_fresh_sheet(wb, "Unmatched_BOT")
-    write_table(
-        ws_un_bot,
-        headers=[
+        ]
+        un_bot_headers = [
             "Key(coord|material)", "Coord", "Material",
             "BOM_Qty", "BOT_Qty", "In_BOM", "In_BOT", "Status",
-        ],
-        rows=unmatched_bot_rows,
-    )
+        ]
+        unmatched_rows = [r[:7] + [r[10]] for r in match_rows if r[10] != "OK"]
+
+    ws_match = ensure_fresh_sheet(wb, "Match_Result")
+    write_table(ws_match, headers=match_headers, rows=match_rows)
+
+    ws_un = ensure_fresh_sheet(wb, "Unmatched")
+    write_table(ws_un, headers=un_headers, rows=unmatched_rows)
+
+    ws_un_top = ensure_fresh_sheet(wb, "Unmatched_TOP")
+    write_table(ws_un_top, headers=un_top_headers, rows=unmatched_top_rows)
+
+    ws_un_bot = ensure_fresh_sheet(wb, "Unmatched_BOT")
+    write_table(ws_un_bot, headers=un_bot_headers, rows=unmatched_bot_rows)
 
     dup_rows = []
     dup_count_bom = dup_count_top = dup_count_bot = 0
@@ -449,15 +515,45 @@ def run_gui() -> None:
     """tkinter 폼: BOM/TOP/BOT 파일·시트·범위 선택 후 매칭 실행."""
     root = tk.Tk()
     root.title("BOM / TOP / BOT 매칭")
-    root.geometry("520x480")
+    root.geometry("820x680")
     root.resizable(True, True)
 
     main_frame = ttk.Frame(root, padding=12)
     main_frame.pack(fill=tk.BOTH, expand=True)
 
+    # 엑셀 COM 상태 (앱 1개, 워크북 BOM/TOP/BOT 각 1개)
+    excel_state: Dict[str, object] = {"app": None, "bom_wb": None, "top_wb": None, "bot_wb": None}
+
+    def open_in_excel(path_var: tk.StringVar, key: str) -> None:
+        path = path_var.get().strip()
+        if not path:
+            messagebox.showwarning("안내", "먼저 파일을 선택해 주세요.")
+            return
+        try:
+            existing_app = excel_state.get("app")
+            app, wb = _excel_open_file(path, existing_app)
+            excel_state["app"] = app
+            excel_state[f"{key}_wb"] = wb
+            messagebox.showinfo("안내", "엑셀에서 파일이 열렸습니다.\n시트를 선택한 뒤 범위를 드래그하고, '가져오기'를 누르세요.")
+        except Exception as e:
+            messagebox.showerror("엑셀 열기 오류", str(e))
+
+    def get_selection_and_apply(wb_key: str, sheet_var: tk.StringVar, range_var: tk.StringVar) -> None:
+        app = excel_state.get("app")
+        wb = excel_state.get(f"{wb_key}_wb")
+        if not app or not wb:
+            messagebox.showwarning("안내", "먼저 해당 파일을 '엑셀에서 열기'로 열어 주세요.")
+            return
+        try:
+            sheet_name, addr = _excel_get_selection(app, wb)
+            sheet_var.set(sheet_name)
+            range_var.set(addr)
+        except Exception as e:
+            messagebox.showerror("범위 가져오기 오류", str(e))
+
     ttk.Label(main_frame, text="BOM 파일:").grid(row=0, column=0, sticky=tk.W, pady=2)
     bom_path_var = tk.StringVar()
-    ttk.Entry(main_frame, textvariable=bom_path_var, width=42).grid(row=0, column=1, padx=4, pady=2)
+    ttk.Entry(main_frame, textvariable=bom_path_var, width=38).grid(row=0, column=1, padx=4, pady=2)
 
     def browse_bom():
         path = filedialog.askopenfilename(
@@ -472,10 +568,17 @@ def run_gui() -> None:
                 bom_sheet_combo.set(names[0])
 
     ttk.Button(main_frame, text="찾아보기", command=browse_bom).grid(row=0, column=2, pady=2)
+    btn_bom_excel = ttk.Button(
+        main_frame, text="엑셀에서 열기",
+        command=lambda: open_in_excel(bom_path_var, "bom"),
+    )
+    btn_bom_excel.grid(row=0, column=3, padx=2, pady=2)
+    if not _EXCEL_COM_AVAILABLE:
+        btn_bom_excel.state(["disabled"])
 
     ttk.Label(main_frame, text="TOP 파일:").grid(row=1, column=0, sticky=tk.W, pady=2)
     top_path_var = tk.StringVar()
-    ttk.Entry(main_frame, textvariable=top_path_var, width=42).grid(row=1, column=1, padx=4, pady=2)
+    ttk.Entry(main_frame, textvariable=top_path_var, width=38).grid(row=1, column=1, padx=4, pady=2)
 
     def browse_top():
         path = filedialog.askopenfilename(
@@ -490,10 +593,17 @@ def run_gui() -> None:
                 top_sheet_combo.set(names[0])
 
     ttk.Button(main_frame, text="찾아보기", command=browse_top).grid(row=1, column=2, pady=2)
+    btn_top_excel = ttk.Button(
+        main_frame, text="엑셀에서 열기",
+        command=lambda: open_in_excel(top_path_var, "top"),
+    )
+    btn_top_excel.grid(row=1, column=3, padx=2, pady=2)
+    if not _EXCEL_COM_AVAILABLE:
+        btn_top_excel.state(["disabled"])
 
     ttk.Label(main_frame, text="BOT 파일:").grid(row=2, column=0, sticky=tk.W, pady=2)
     bot_path_var = tk.StringVar()
-    ttk.Entry(main_frame, textvariable=bot_path_var, width=42).grid(row=2, column=1, padx=4, pady=2)
+    ttk.Entry(main_frame, textvariable=bot_path_var, width=38).grid(row=2, column=1, padx=4, pady=2)
 
     def browse_bot():
         path = filedialog.askopenfilename(
@@ -508,12 +618,19 @@ def run_gui() -> None:
                 bot_sheet_combo.set(names[0])
 
     ttk.Button(main_frame, text="찾아보기", command=browse_bot).grid(row=2, column=2, pady=2)
+    btn_bot_excel = ttk.Button(
+        main_frame, text="엑셀에서 열기",
+        command=lambda: open_in_excel(bot_path_var, "bot"),
+    )
+    btn_bot_excel.grid(row=2, column=3, padx=2, pady=2)
+    if not _EXCEL_COM_AVAILABLE:
+        btn_bot_excel.state(["disabled"])
 
     ttk.Label(main_frame, text="저장 경로 (비우면 BOM과 같은 폴더에 _matched.xlsx):").grid(
         row=3, column=0, sticky=tk.W, pady=2
     )
     output_path_var = tk.StringVar()
-    ttk.Entry(main_frame, textvariable=output_path_var, width=42).grid(row=3, column=1, padx=4, pady=2)
+    ttk.Entry(main_frame, textvariable=output_path_var, width=38).grid(row=3, column=1, padx=4, pady=2)
 
     def browse_output():
         path = filedialog.asksaveasfilename(
@@ -526,9 +643,9 @@ def run_gui() -> None:
 
     ttk.Button(main_frame, text="찾아보기", command=browse_output).grid(row=3, column=2, pady=2)
 
-    ttk.Separator(main_frame, orient=tk.HORIZONTAL).grid(row=4, column=0, columnspan=3, sticky=tk.EW, pady=10)
-    ttk.Label(main_frame, text="시트 및 범위 (각 1열, 예: B2:B200):").grid(
-        row=5, column=0, columnspan=3, sticky=tk.W
+    ttk.Separator(main_frame, orient=tk.HORIZONTAL).grid(row=4, column=0, columnspan=4, sticky=tk.EW, pady=10)
+    ttk.Label(main_frame, text="시트 및 범위 (직접 입력 또는 엑셀에서 범위 선택 후 '가져오기'):").grid(
+        row=5, column=0, columnspan=4, sticky=tk.W
     )
 
     bom_sheet_var = tk.StringVar()
@@ -544,28 +661,46 @@ def run_gui() -> None:
     bot_coord_var = tk.StringVar(value="C2:C200")
     bot_qty_var = tk.StringVar(value="D2:D200")
 
-    def _grid_section(r, label, combo_widget, mat_var, coord_var, qty_var):
+    def _grid_section(r, label, combo_widget, sheet_var, mat_var, coord_var, qty_var, wb_key: str):
         ttk.Label(main_frame, text=label).grid(row=r, column=0, sticky=tk.W, pady=2)
         combo_widget.grid(row=r, column=1, padx=4, pady=2)
         ttk.Label(main_frame, text="자재범위").grid(row=r + 1, column=0, sticky=tk.W, pady=2)
-        ttk.Entry(main_frame, textvariable=mat_var, width=22).grid(row=r + 1, column=1, padx=4, pady=2)
+        ttk.Entry(main_frame, textvariable=mat_var, width=20).grid(row=r + 1, column=1, padx=4, pady=2)
+        btn_mat = ttk.Button(main_frame, text="가져오기", width=8, command=lambda: get_selection_and_apply(wb_key, sheet_var, mat_var))
+        btn_mat.grid(row=r + 1, column=2, padx=2, pady=2)
+        if not _EXCEL_COM_AVAILABLE:
+            btn_mat.state(["disabled"])
         ttk.Label(main_frame, text="좌표범위").grid(row=r + 2, column=0, sticky=tk.W, pady=2)
-        ttk.Entry(main_frame, textvariable=coord_var, width=22).grid(row=r + 2, column=1, padx=4, pady=2)
+        ttk.Entry(main_frame, textvariable=coord_var, width=20).grid(row=r + 2, column=1, padx=4, pady=2)
+        btn_coord = ttk.Button(main_frame, text="가져오기", width=8, command=lambda: get_selection_and_apply(wb_key, sheet_var, coord_var))
+        btn_coord.grid(row=r + 2, column=2, padx=2, pady=2)
+        if not _EXCEL_COM_AVAILABLE:
+            btn_coord.state(["disabled"])
         ttk.Label(main_frame, text="수량범위").grid(row=r + 3, column=0, sticky=tk.W, pady=2)
-        ttk.Entry(main_frame, textvariable=qty_var, width=22).grid(row=r + 3, column=1, padx=4, pady=2)
+        ttk.Entry(main_frame, textvariable=qty_var, width=20).grid(row=r + 3, column=1, padx=4, pady=2)
+        btn_qty = ttk.Button(main_frame, text="가져오기", width=8, command=lambda: get_selection_and_apply(wb_key, sheet_var, qty_var))
+        btn_qty.grid(row=r + 3, column=2, padx=2, pady=2)
+        if not _EXCEL_COM_AVAILABLE:
+            btn_qty.state(["disabled"])
 
-    bom_sheet_combo = ttk.Combobox(main_frame, textvariable=bom_sheet_var, width=22)
-    top_sheet_combo = ttk.Combobox(main_frame, textvariable=top_sheet_var, width=22)
-    bot_sheet_combo = ttk.Combobox(main_frame, textvariable=bot_sheet_var, width=22)
+    bom_sheet_combo = ttk.Combobox(main_frame, textvariable=bom_sheet_var, width=20)
+    top_sheet_combo = ttk.Combobox(main_frame, textvariable=top_sheet_var, width=20)
+    bot_sheet_combo = ttk.Combobox(main_frame, textvariable=bot_sheet_var, width=20)
 
-    _grid_section(6, "BOM 시트", bom_sheet_combo, bom_mat_var, bom_coord_var, bom_qty_var)
-    _grid_section(10, "TOP 시트", top_sheet_combo, top_mat_var, top_coord_var, top_qty_var)
-    _grid_section(14, "BOT 시트", bot_sheet_combo, bot_mat_var, bot_coord_var, bot_qty_var)
+    _grid_section(6, "BOM 시트", bom_sheet_combo, bom_sheet_var, bom_mat_var, bom_coord_var, bom_qty_var, "bom")
+    _grid_section(10, "TOP 시트", top_sheet_combo, top_sheet_var, top_mat_var, top_coord_var, top_qty_var, "top")
+    _grid_section(14, "BOT 시트", bot_sheet_combo, bot_sheet_var, bot_mat_var, bot_coord_var, bot_qty_var, "bot")
 
+    material_only_match_var = tk.BooleanVar(value=True)
+    ttk.Checkbutton(
+        main_frame,
+        text="자재명 기준 매칭 (BOM 수량 vs TOP+BOT 총수량)",
+        variable=material_only_match_var,
+    ).grid(row=18, column=0, columnspan=3, sticky=tk.W, pady=4)
     case_insensitive_var = tk.BooleanVar(value=False)
     ttk.Checkbutton(
         main_frame, text="좌표/자재 대소문자 무시", variable=case_insensitive_var
-    ).grid(row=18, column=0, columnspan=2, sticky=tk.W, pady=8)
+    ).grid(row=19, column=0, columnspan=3, sticky=tk.W, pady=4)
 
     def run_match_from_gui() -> None:
         bom_path = bom_path_var.get().strip()
@@ -608,6 +743,7 @@ def run_gui() -> None:
             },
             "options": {
                 "inplace": False,
+                "material_only_match": material_only_match_var.get(),
                 "case_insensitive": case_insensitive_var.get(),
             },
         }
@@ -615,10 +751,17 @@ def run_gui() -> None:
             out = run_match(cfg)
             messagebox.showinfo("완료", f"결과 저장:\n{out}")
         except Exception as e:
-            messagebox.showerror("오류", str(e))
+            err_msg = str(e)
+            if "ranges must have same number of rows" in err_msg:
+                err_msg = (
+                    f"{err_msg}\n\n"
+                    "자재·좌표·수량 범위는 행 개수가 같아야 합니다.\n"
+                    "해당 시트(BOM/TOP/BOT)에서 세 범위를 같은 행 수로 다시 선택해 주세요."
+                )
+            messagebox.showerror("오류", err_msg)
 
     ttk.Button(main_frame, text="매칭 실행", command=run_match_from_gui).grid(
-        row=19, column=1, pady=12
+        row=20, column=1, columnspan=2, pady=12
     )
 
     root.mainloop()

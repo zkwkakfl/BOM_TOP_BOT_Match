@@ -21,6 +21,7 @@
   },
   "options": {
     "inplace": false,
+    "material_only_match": true,
     "case_insensitive": false
   }
 }
