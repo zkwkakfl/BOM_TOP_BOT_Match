@@ -1,0 +1,4 @@
+include README.md
+include requirements.txt
+include config_example.json
+include config_example_3files.json
