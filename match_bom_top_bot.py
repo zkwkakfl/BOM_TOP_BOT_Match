@@ -75,7 +75,8 @@ class SheetData:
     coord_to_count: Dict[str, int] = field(default_factory=dict)
     coord_to_rows: Dict[str, List[int]] = field(default_factory=dict)
     coord_to_material_counts: Dict[str, Dict[str, int]] = field(default_factory=dict)
-    material_to_qty: Dict[str, float] = field(default_factory=dict)  # 자재명별 총수량 (자재명 기준 매칭용)
+    material_to_qty: Dict[str, float] = field(default_factory=dict)  # 자재명별 총수량 (분리된 좌표 개수 합)
+    qty_mismatch_rows: List[Tuple[int, float, int]] = field(default_factory=list)  # (행번호, 수량열값, 좌표개수) 수량열≠좌표개수인 행
 
 
 def norm_text(v: object, *, case_insensitive: bool) -> str:
@@ -174,13 +175,19 @@ def build_sheet_data(
     for i in range(len(mats)):
         mat = norm_text(mats[i], case_insensitive=case_insensitive)
         coord_text = coords[i]
-        qty = norm_qty(qtys[i])
+        coords_list = split_coords(coord_text)
+        coord_count = len(coords_list)
+        qty_col = norm_qty(qtys[i])
         row_num = mat_rows[i]
 
-        if not mat and (coord_text is None or str(coord_text).strip() == ""):
+        if not mat and not coords_list:
             continue
 
-        for coord_raw in split_coords(coord_text):
+        # 수량 = 구분자로 분리된 좌표명 개수. 수량열 값과 다르면 검증 목록에 기록
+        if abs(qty_col - coord_count) > 1e-9:
+            sd.qty_mismatch_rows.append((row_num, qty_col, coord_count))
+
+        for coord_raw in coords_list:
             coord = norm_text(coord_raw, case_insensitive=case_insensitive)
             if coord:
                 bump(sd.coord_to_count, coord, 1)
@@ -192,7 +199,7 @@ def build_sheet_data(
 
             if coord and mat:
                 key: Key = (coord, mat)
-                sd.key_to_qty[key] = sd.key_to_qty.get(key, 0.0) + qty
+                sd.key_to_qty[key] = sd.key_to_qty.get(key, 0.0) + 1.0
                 add_row_list(sd.key_to_rows, key, row_num)
 
     for (_c, mat), q in sd.key_to_qty.items():
@@ -201,15 +208,16 @@ def build_sheet_data(
 
 
 def compute_status(in_bom: bool, in_board: bool, bom_qty: float, board_qty: float) -> str:
+    """상태 한글 반환: 한눈에 알아보기 쉽게."""
     if in_bom and in_board:
         if abs(bom_qty - board_qty) < 1e-9:
-            return "OK"
-        return "QTY_MISMATCH"
+            return "일치"
+        return "수량 불일치"
     if in_bom and not in_board:
-        return "MISSING_ON_TOPBOT"
+        return "TOP/BOT에 없음"
     if (not in_bom) and in_board:
-        return "EXTRA_ON_TOPBOT"
-    return "UNKNOWN"
+        return "TOP/BOT에만 있음"
+    return "알 수 없음"
 
 
 def ensure_fresh_sheet(wb, name: str):
@@ -365,19 +373,19 @@ def run_match(config: dict) -> str:
                 status,
             ]
             match_rows.append(row)
-            if status == "OK":
+            if status == "일치":
                 ok_count += 1
-            if status_top != "OK" and (in_b or in_t):
+            if status_top != "일치" and (in_b or in_t):
                 unmatched_top_count += 1
                 unmatched_top_rows.append([mat, q_b, q_t, "Y" if in_b else "", "Y" if in_t else "", status_top])
-            if status_bot != "OK" and (in_b or in_bo):
+            if status_bot != "일치" and (in_b or in_bo):
                 unmatched_bot_count += 1
                 unmatched_bot_rows.append([mat, q_b, q_bo, "Y" if in_b else "", "Y" if in_bo else "", status_bot])
-        match_headers = ["Material", "BOM_Qty", "TOP_Qty", "BOT_Qty", "TOP+BOT_Qty", "In_BOM", "In_TOP", "In_BOT", "Status"]
-        un_headers = ["Material", "BOM_Qty", "TOP_Qty", "BOT_Qty", "TOP+BOT_Qty", "Status"]
-        un_top_headers = ["Material", "BOM_Qty", "TOP_Qty", "In_BOM", "In_TOP", "Status"]
-        un_bot_headers = ["Material", "BOM_Qty", "BOT_Qty", "In_BOM", "In_BOT", "Status"]
-        unmatched_rows = [r[:5] + [r[8]] for r in match_rows if r[8] != "OK"]
+        match_headers = ["자재", "BOM수량", "TOP수량", "BOT수량", "TOP+BOT수량", "BOM여부", "TOP여부", "BOT여부", "상태"]
+        un_headers = ["자재", "BOM수량", "TOP수량", "BOT수량", "TOP+BOT수량", "상태"]
+        un_top_headers = ["자재", "BOM수량", "TOP수량", "BOM여부", "TOP여부", "상태"]
+        un_bot_headers = ["자재", "BOM수량", "BOT수량", "BOM여부", "BOT여부", "상태"]
+        unmatched_rows = [r[:5] + [r[8]] for r in match_rows if r[8] != "일치"]
     else:
         # 좌표+자재 기준 (기존): (coord, material) 키별 매칭
         all_keys = set(bom.key_to_qty) | set(top.key_to_qty) | set(bot.key_to_qty)
@@ -405,50 +413,62 @@ def run_match(config: dict) -> str:
                 status,
             ]
             match_rows.append(row)
-            if status == "OK":
+            if status == "일치":
                 ok_count += 1
-            if status_top != "OK" and (in_b or in_t):
+            if status_top != "일치" and (in_b or in_t):
                 unmatched_top_count += 1
                 unmatched_top_rows.append([
                     key_str, coord, mat, q_b, q_t,
                     "Y" if in_b else "", "Y" if in_t else "", status_top,
                 ])
-            if status_bot != "OK" and (in_b or in_bo):
+            if status_bot != "일치" and (in_b or in_bo):
                 unmatched_bot_count += 1
                 unmatched_bot_rows.append([
                     key_str, coord, mat, q_b, q_bo,
                     "Y" if in_b else "", "Y" if in_bo else "", status_bot,
                 ])
         match_headers = [
-            "Key(coord|material)", "Coord", "Material",
-            "BOM_Qty", "TOP_Qty", "BOT_Qty", "TOP+BOT_Qty",
-            "In_BOM", "In_TOP", "In_BOT", "Status",
+            "키(좌표|자재)", "좌표", "자재",
+            "BOM수량", "TOP수량", "BOT수량", "TOP+BOT수량",
+            "BOM여부", "TOP여부", "BOT여부", "상태",
         ]
         un_headers = [
-            "Key(coord|material)", "Coord", "Material",
-            "BOM_Qty", "TOP_Qty", "BOT_Qty", "TOP+BOT_Qty", "Status",
+            "키(좌표|자재)", "좌표", "자재",
+            "BOM수량", "TOP수량", "BOT수량", "TOP+BOT수량", "상태",
         ]
         un_top_headers = [
-            "Key(coord|material)", "Coord", "Material",
-            "BOM_Qty", "TOP_Qty", "In_BOM", "In_TOP", "Status",
+            "키(좌표|자재)", "좌표", "자재",
+            "BOM수량", "TOP수량", "BOM여부", "TOP여부", "상태",
         ]
         un_bot_headers = [
-            "Key(coord|material)", "Coord", "Material",
-            "BOM_Qty", "BOT_Qty", "In_BOM", "In_BOT", "Status",
+            "키(좌표|자재)", "좌표", "자재",
+            "BOM수량", "BOT수량", "BOM여부", "BOT여부", "상태",
         ]
-        unmatched_rows = [r[:7] + [r[10]] for r in match_rows if r[10] != "OK"]
+        unmatched_rows = [r[:7] + [r[10]] for r in match_rows if r[10] != "일치"]
 
-    ws_match = ensure_fresh_sheet(wb, "Match_Result")
+    ws_match = ensure_fresh_sheet(wb, "매칭결과")
     write_table(ws_match, headers=match_headers, rows=match_rows)
 
-    ws_un = ensure_fresh_sheet(wb, "Unmatched")
+    ws_un = ensure_fresh_sheet(wb, "불일치")
     write_table(ws_un, headers=un_headers, rows=unmatched_rows)
 
-    ws_un_top = ensure_fresh_sheet(wb, "Unmatched_TOP")
+    ws_un_top = ensure_fresh_sheet(wb, "불일치_TOP")
     write_table(ws_un_top, headers=un_top_headers, rows=unmatched_top_rows)
 
-    ws_un_bot = ensure_fresh_sheet(wb, "Unmatched_BOT")
+    ws_un_bot = ensure_fresh_sheet(wb, "불일치_BOT")
     write_table(ws_un_bot, headers=un_bot_headers, rows=unmatched_bot_rows)
+
+    qty_verify_rows: List[Tuple[str, str, int, float, int]] = []
+    for sd in (bom, top, bot):
+        for row_num, qty_col, coord_count in sd.qty_mismatch_rows:
+            qty_verify_rows.append((sd.label, sd.sheet_name, row_num, qty_col, coord_count))
+    if qty_verify_rows:
+        ws_qty = ensure_fresh_sheet(wb, "수량검증")
+        write_table(
+            ws_qty,
+            headers=["시트구분", "시트명", "행번호", "수량열값", "좌표개수"],
+            rows=[list(r) for r in qty_verify_rows],
+        )
 
     dup_rows = []
     dup_count_bom = dup_count_top = dup_count_bot = 0
@@ -466,18 +486,18 @@ def run_match(config: dict) -> str:
                     materials_summary(sd, coord),
                     rows_summary(sd.coord_to_rows.get(coord, [])),
                 ])
-    ws_dup = ensure_fresh_sheet(wb, "Coord_Duplicates")
+    ws_dup = ensure_fresh_sheet(wb, "좌표중복")
     write_table(
         ws_dup,
-        headers=["SheetLabel", "SheetName", "Coord", "Count", "Materials(count)", "Rows"],
+        headers=["시트구분", "시트명", "좌표", "건수", "자재(건수)", "행"],
         rows=dup_rows,
     )
 
-    ws_summary = ensure_fresh_sheet(wb, "Summary")
+    ws_summary = ensure_fresh_sheet(wb, "요약")
     write_table(
         ws_summary,
         headers=[
-            "구분", "매칭됨(OK)", "불일치(TOP)", "불일치(BOT)",
+            "구분", "매칭됨(일치)", "불일치(TOP)", "불일치(BOT)",
             "중복좌표_BOM", "중복좌표_TOP", "중복좌표_BOT",
         ],
         rows=[
@@ -640,7 +660,7 @@ def run_gui() -> None:
             return
         folder_path_var.set(folder)
         file_listbox.delete(0, tk.END)
-        for ext in ("*.xlsx", "*.xlsm"):
+        for ext in ("*.xlsx", "*.xlsm", "*.xls"):
             for p in sorted(glob.glob(os.path.join(folder, ext))):
                 file_listbox.insert(tk.END, os.path.basename(p))
 
