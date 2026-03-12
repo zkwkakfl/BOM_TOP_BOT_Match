@@ -363,6 +363,8 @@ def run_match(config: dict) -> str:
     inplace = bool(opts.get("inplace", False))
     case_insensitive = bool(opts.get("case_insensitive", False))
     material_only_match = bool(opts.get("material_only_match", True))  # 자재명 기준, TOP+BOT 총수량과 BOM 매칭
+    top_skipped = bool(opts.get("top_skipped", False))  # TOP 면 사용 여부
+    bot_skipped = bool(opts.get("bot_skipped", False))  # BOT 면 사용 여부
     output_path = config.get("output_path") or ""
 
     bom_cfg = config["bom"]
@@ -372,11 +374,9 @@ def run_match(config: dict) -> str:
     # 3개 파일 모드
     if "bom_file" in config:
         bom_path = config["bom_file"]
-        top_path = config["top_file"]
-        bot_path = config["bot_file"]
+        top_path = config.get("top_file") or ""
+        bot_path = config.get("bot_file") or ""
         wb_bom = _load_workbook(bom_path)
-        wb_top = _load_workbook(top_path)
-        wb_bot = _load_workbook(bot_path)
         bom = build_sheet_data(
             wb_bom, label="BOM", sheet_name=bom_cfg["sheet"],
             material_range=bom_cfg["material_range"],
@@ -384,20 +384,32 @@ def run_match(config: dict) -> str:
             qty_range=bom_cfg["qty_range"],
             case_insensitive=case_insensitive,
         )
-        top = build_sheet_data(
-            wb_top, label="TOP", sheet_name=top_cfg["sheet"],
-            material_range=top_cfg["material_range"],
-            coord_range=top_cfg["coord_range"],
-            qty_range=top_cfg["qty_range"],
-            case_insensitive=case_insensitive,
-        )
-        bot = build_sheet_data(
-            wb_bot, label="BOT", sheet_name=bot_cfg["sheet"],
-            material_range=bot_cfg["material_range"],
-            coord_range=bot_cfg["coord_range"],
-            qty_range=bot_cfg["qty_range"],
-            case_insensitive=case_insensitive,
-        )
+        if top_skipped:
+            top = SheetData(label="TOP", sheet_name="(없음)")
+        else:
+            if not top_path:
+                raise ValueError("TOP 파일이 지정되지 않았습니다. TOP을 사용하려면 파일을 선택해 주세요.")
+            wb_top = _load_workbook(top_path)
+            top = build_sheet_data(
+                wb_top, label="TOP", sheet_name=top_cfg["sheet"],
+                material_range=top_cfg["material_range"],
+                coord_range=top_cfg["coord_range"],
+                qty_range=top_cfg["qty_range"],
+                case_insensitive=case_insensitive,
+            )
+        if bot_skipped:
+            bot = SheetData(label="BOT", sheet_name="(없음)")
+        else:
+            if not bot_path:
+                raise ValueError("BOT 파일이 지정되지 않았습니다. BOT을 사용하려면 파일을 선택해 주세요.")
+            wb_bot = _load_workbook(bot_path)
+            bot = build_sheet_data(
+                wb_bot, label="BOT", sheet_name=bot_cfg["sheet"],
+                material_range=bot_cfg["material_range"],
+                coord_range=bot_cfg["coord_range"],
+                qty_range=bot_cfg["qty_range"],
+                case_insensitive=case_insensitive,
+            )
         wb = Workbook()
         default_sheet = wb.active
         if default_sheet:
@@ -607,20 +619,18 @@ def _get_sheet_names(file_path: str) -> List[str]:
 
 
 def run_gui() -> None:
-    """tkinter 폼: BOM/TOP/BOT 파일·시트·범위 선택 후 매칭 실행."""
+    """tkinter 위저드: 단계별로 BOM → TOP → BOT → 요약 순서로 설정 후 매칭 실행."""
     root = tk.Tk()
     root.title("BOM / TOP / BOT 매칭")
-    root.geometry("820x700")
+    root.geometry("900x720")
     root.resizable(True, True)
-
-    main_frame = ttk.Frame(root, padding=12)
-    main_frame.pack(fill=tk.BOTH, expand=True)
 
     # 엑셀 COM 상태 (앱 1개, 워크북 BOM/TOP/BOT 각 1개)
     excel_state: Dict[str, object] = {"app": None, "bom_wb": None, "top_wb": None, "bot_wb": None}
 
-    def open_in_excel(path_var: tk.StringVar, key: str) -> None:
-        path = path_var.get().strip()
+    def open_in_excel(path: str, key: str) -> None:
+        """지정된 파일을 엑셀에서 열기. wizard 단계와 무관하게 동작."""
+        path = path.strip()
         if not path:
             messagebox.showwarning("안내", "먼저 파일을 선택해 주세요.")
             return
@@ -637,7 +647,7 @@ def run_gui() -> None:
                     excel_state["bom_wb"] = None
                     excel_state["top_wb"] = None
                     excel_state["bot_wb"] = None
-            app, wb = _excel_open_file(path, existing_app)
+            app, wb = _excel_open_file(path, existing_app)  # type: ignore[arg-type]
             excel_state["app"] = app
             excel_state[f"{key}_wb"] = wb
             app.Visible = True
@@ -652,7 +662,7 @@ def run_gui() -> None:
 
     def get_selection_and_apply(wb_key: str, sheet_var: tk.StringVar, range_var: tk.StringVar) -> None:
         app = excel_state.get("app")
-        wb = excel_state.get(f"{wb_key}_wb")
+        wb = excel_state.get(f"{wb_key}_wb")  # type: ignore[assignment]
         if not app or not wb:
             messagebox.showwarning("안내", "먼저 해당 파일을 '엑셀에서 열기'로 열어 주세요.")
             return
@@ -672,11 +682,11 @@ def run_gui() -> None:
     ) -> None:
         """VBA 유저폼 방식: 범위 입력란 더블클릭 시 안내 라벨이 있는 작은 대화상자 → 엑셀에서 선택 후 확인."""
         app = excel_state.get("app")
-        wb = excel_state.get(f"{wb_key}_wb")
+        wb = excel_state.get(f"{wb_key}_wb")  # type: ignore[assignment]
         if not app or not wb:
             messagebox.showwarning(
                 "안내",
-                "먼저 해당 파일을 리스트에서 더블클릭하여 엑셀에서 열어 주세요.",
+                "먼저 해당 파일을 '엑셀에서 열기' 버튼으로 엑셀에서 열어 주세요.",
             )
             return
         dlg = tk.Toplevel(parent)
@@ -710,14 +720,20 @@ def run_gui() -> None:
         dlg.grab_set()
         dlg.focus_set()
 
-    # 폴더 선택 → 리스트박스 → 더블클릭으로 BOM/TOP/BOT 파일 지정
+    # ----- 공통 상단 영역: 폴더 + 파일 리스트 -----
+    main_frame = ttk.Frame(root, padding=12)
+    main_frame.pack(fill=tk.BOTH, expand=True)
+
+    top_common = ttk.LabelFrame(main_frame, text="1단계: 파일 목록", padding=8)
+    top_common.pack(fill=tk.X, pady=(0, 8))
+
     folder_path_var = tk.StringVar()
     bom_path_var = tk.StringVar()
     top_path_var = tk.StringVar()
     bot_path_var = tk.StringVar()
 
-    ttk.Label(main_frame, text="파일 폴더:").grid(row=0, column=0, sticky=tk.W, pady=2)
-    ttk.Entry(main_frame, textvariable=folder_path_var, width=38).grid(row=0, column=1, padx=4, pady=2)
+    ttk.Label(top_common, text="파일 폴더:").grid(row=0, column=0, sticky=tk.W, pady=2)
+    ttk.Entry(top_common, textvariable=folder_path_var, width=50).grid(row=0, column=1, padx=4, pady=2)
 
     def browse_folder() -> None:
         folder = filedialog.askdirectory(title="BOM/TOP/BOT 파일이 있는 폴더 선택")
@@ -725,23 +741,26 @@ def run_gui() -> None:
             return
         folder_path_var.set(folder)
         file_listbox.delete(0, tk.END)
+        bom_path_var.set("")
+        top_path_var.set("")
+        bot_path_var.set("")
         for ext in ("*.xlsx", "*.xlsm", "*.xls"):
             for p in sorted(glob.glob(os.path.join(folder, ext))):
-                file_listbox.insert(tk.END, os.path.basename(p))
+                name = os.path.basename(p)
+                file_listbox.insert(tk.END, name)
+                # 간단한 파일명 패턴 기반 자동 매핑(BOM/TOP/BOT)
+                lower = name.lower()
+                if "bom" in lower and not bom_path_var.get():
+                    bom_path_var.set(os.path.normpath(os.path.join(folder, name)))
+                elif "top" in lower and not top_path_var.get():
+                    top_path_var.set(os.path.normpath(os.path.join(folder, name)))
+                elif "bot" in lower and not bot_path_var.get():
+                    bot_path_var.set(os.path.normpath(os.path.join(folder, name)))
 
-    ttk.Button(main_frame, text="폴더 선택", command=browse_folder).grid(row=0, column=2, pady=2)
+    ttk.Button(top_common, text="폴더 선택", command=browse_folder).grid(row=0, column=2, pady=2, padx=4)
 
-    double_click_target = tk.StringVar(value="bom")
-
-    ttk.Label(main_frame, text="더블클릭 시 지정:").grid(row=1, column=0, sticky=tk.W, pady=2)
-    frame_radio = ttk.Frame(main_frame)
-    frame_radio.grid(row=1, column=1, columnspan=2, sticky=tk.W, padx=4)
-    ttk.Radiobutton(frame_radio, text="BOM", variable=double_click_target, value="bom").pack(side=tk.LEFT, padx=4)
-    ttk.Radiobutton(frame_radio, text="TOP", variable=double_click_target, value="top").pack(side=tk.LEFT, padx=4)
-    ttk.Radiobutton(frame_radio, text="BOT", variable=double_click_target, value="bot").pack(side=tk.LEFT, padx=4)
-
-    list_frame = ttk.Frame(main_frame)
-    list_frame.grid(row=2, column=0, columnspan=3, sticky=tk.NSEW, pady=4)
+    list_frame = ttk.Frame(top_common)
+    list_frame.grid(row=1, column=0, columnspan=3, sticky=tk.NSEW, pady=4)
     file_listbox = tk.Listbox(list_frame, height=6, selectmode=tk.SINGLE, font=("Segoe UI", 9))
     scrollbar = ttk.Scrollbar(list_frame)
     file_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -749,8 +768,32 @@ def run_gui() -> None:
     file_listbox.config(yscrollcommand=scrollbar.set)
     scrollbar.config(command=file_listbox.yview)
 
-    path_vars = {"bom": bom_path_var, "top": top_path_var, "bot": bot_path_var}
-    sheet_combos = {"bom": None, "top": None, "bot": None}  # 아래에서 콤보 생성 후 채움
+    # ----- 위저드 상태 -----
+    current_step = tk.IntVar(value=1)  # 1=BOM, 2=TOP, 3=BOT, 4=요약
+
+    def _active_role_for_step() -> str | None:
+        """현재 위저드 단계에 따라 기본 역할 반환."""
+        step = current_step.get()
+        if step == 1:
+            return "bom"
+        if step == 2:
+            return "top"
+        if step == 3:
+            return "bot"
+        return None
+
+    def _guess_role_from_filename(name: str) -> str | None:
+        lower = name.lower()
+        if "bom" in lower:
+            return "bom"
+        if "top" in lower:
+            return "top"
+        if "bot" in lower:
+            return "bot"
+        return None
+
+    # 아래에서 콤보 생성 후 채움
+    sheet_combos: Dict[str, ttk.Combobox] = {"bom": None, "top": None, "bot": None}  # type: ignore[assignment]
 
     def on_file_double_click(_event) -> None:
         sel = file_listbox.curselection()
@@ -765,45 +808,51 @@ def run_gui() -> None:
         if not os.path.isfile(full_path):
             messagebox.showerror("오류", f"파일을 찾을 수 없습니다: {full_path}")
             return
-        target = double_click_target.get()
-        path_var = path_vars[target]
-        path_var.set(full_path)
+        target = _active_role_for_step()
+        if target is None:
+            messagebox.showwarning("안내", "먼저 BOM/TOP/BOT 단계 중 하나를 진행해 주세요.")
+            return
+        guessed = _guess_role_from_filename(name)
+        if guessed and guessed != target:
+            role_label = {"bom": "BOM", "top": "TOP", "bot": "BOT"}[guessed]
+            cur_label = {"bom": "BOM", "top": "TOP", "bot": "BOT"}[target]
+            msg = (
+                f"파일 이름을 보니 '{name}' 는 {role_label} 파일로 보입니다.\n\n"
+                f"현재 단계는 {cur_label} 설정 단계입니다.\n"
+                f"이 파일을 {role_label} 파일로 지정할까요?"
+            )
+            if messagebox.askyesno("파일 역할 확인", msg):
+                target = guessed
+        if target == "bom":
+            bom_path_var.set(full_path)
+        elif target == "top":
+            top_path_var.set(full_path)
+        elif target == "bot":
+            bot_path_var.set(full_path)
         combo = sheet_combos.get(target)
-        if combo:
+        if combo is not None:
             names = _get_sheet_names(full_path)
             combo["values"] = names
             if names:
                 combo.set(names[0])
         if _EXCEL_COM_AVAILABLE:
             try:
-                open_in_excel(path_var, target)
+                open_in_excel(full_path, target)
             except Exception as e:
                 messagebox.showerror("엑셀 열기 오류", str(e))
 
     file_listbox.bind("<Double-Button-1>", on_file_double_click)
 
-    ttk.Label(main_frame, text="저장 경로 (비우면 BOM과 같은 폴더에 _matched.xlsx):").grid(
-        row=3, column=0, sticky=tk.W, pady=2
-    )
+    # ----- 아래 영역: 위저드 단계별 내용 -----
+    wizard_frame = ttk.Frame(main_frame)
+    wizard_frame.pack(fill=tk.BOTH, expand=True)
+
+    # 공통 옵션/출력 경로는 모든 단계 아래쪽에 위치
     output_path_var = tk.StringVar()
-    ttk.Entry(main_frame, textvariable=output_path_var, width=38).grid(row=3, column=1, padx=4, pady=2)
+    material_only_match_var = tk.BooleanVar(value=True)
+    case_insensitive_var = tk.BooleanVar(value=False)
 
-    def browse_output():
-        path = filedialog.asksaveasfilename(
-            title="결과 저장 위치",
-            defaultextension=".xlsx",
-            filetypes=[("Excel", "*.xlsx"), ("모든 파일", "*.*")],
-        )
-        if path:
-            output_path_var.set(path)
-
-    ttk.Button(main_frame, text="찾아보기", command=browse_output).grid(row=3, column=2, pady=2)
-
-    ttk.Separator(main_frame, orient=tk.HORIZONTAL).grid(row=4, column=0, columnspan=4, sticky=tk.EW, pady=10)
-    ttk.Label(main_frame, text="시트 및 범위 (직접 입력 또는 범위 입력란 더블클릭 → 엑셀에서 선택 후 확인):").grid(
-        row=5, column=0, columnspan=4, sticky=tk.W
-    )
-
+    # 시트/범위 변수
     bom_sheet_var = tk.StringVar()
     top_sheet_var = tk.StringVar()
     bot_sheet_var = tk.StringVar()
@@ -817,82 +866,255 @@ def run_gui() -> None:
     bot_coord_var = tk.StringVar(value="C2:C200")
     bot_qty_var = tk.StringVar(value="D2:D200")
 
-    def _grid_section(r, label, combo_widget, sheet_var, mat_var, coord_var, qty_var, wb_key: str) -> None:
-        ttk.Label(main_frame, text=label).grid(row=r, column=0, sticky=tk.W, pady=2)
-        combo_widget.grid(row=r, column=1, padx=4, pady=2)
-        ttk.Label(main_frame, text="자재범위").grid(row=r + 1, column=0, sticky=tk.W, pady=2)
-        entry_mat = ttk.Entry(main_frame, textvariable=mat_var, width=20)
-        entry_mat.grid(row=r + 1, column=1, padx=4, pady=2)
+    # TOP/BOT 사용 여부 (없음/건너뛰기 플래그)
+    top_skip_var = tk.BooleanVar(value=False)
+    bot_skip_var = tk.BooleanVar(value=False)
+
+    def browse_output():
+        path = filedialog.asksaveasfilename(
+            title="결과 저장 위치",
+            defaultextension=".xlsx",
+            filetypes=[("Excel", "*.xlsx"), ("모든 파일", "*.*")],
+        )
+        if path:
+            output_path_var.set(path)
+
+    # 위저드 각 단계용 프레임
+    step_frames: Dict[int, ttk.Frame] = {
+        1: ttk.Frame(wizard_frame),
+        2: ttk.Frame(wizard_frame),
+        3: ttk.Frame(wizard_frame),
+        4: ttk.Frame(wizard_frame),
+    }
+
+    def show_step(step: int) -> None:
+        for s, f in step_frames.items():
+            f.pack_forget()
+        step_frames[step].pack(fill=tk.BOTH, expand=True)
+        current_step.set(step)
+
+    def _grid_section(container, label, sheet_var, mat_var, coord_var, qty_var, wb_key: str) -> None:
+        """
+        시트/범위 입력 블록을 하나의 서브 프레임(row_frame) 안에서 grid로 배치하고,
+        row_frame 자체는 부모(container)에 pack으로 붙인다.
+        (같은 컨테이너에서 pack/grid 혼용 오류 방지용)
+        """
+        row_frame = ttk.Frame(container)
+        row_frame.pack(anchor=tk.W, pady=4, fill=tk.X)
+
+        ttk.Label(row_frame, text=label).grid(row=0, column=0, sticky=tk.W, pady=2)
+        combo_widget = ttk.Combobox(row_frame, textvariable=sheet_var, width=22)
+        combo_widget.grid(row=0, column=1, padx=4, pady=2, sticky=tk.W)
+        sheet_combos[wb_key] = combo_widget  # 파일 더블클릭 시 시트 목록 채우기용
+        ttk.Label(row_frame, text="자재범위").grid(row=1, column=0, sticky=tk.W, pady=2)
+        entry_mat = ttk.Entry(row_frame, textvariable=mat_var, width=20)
+        entry_mat.grid(row=1, column=1, padx=4, pady=2, sticky=tk.W)
         if _EXCEL_COM_AVAILABLE:
             entry_mat.bind(
                 "<Double-Button-1>",
                 lambda e, k=wb_key, sv=sheet_var, rv=mat_var: open_range_picker_dialog(
-                    main_frame, k, rv, sv, "자재 범위"
+                    row_frame, k, rv, sv, "자재 범위"
                 ),
             )
-        ttk.Label(main_frame, text="좌표범위").grid(row=r + 2, column=0, sticky=tk.W, pady=2)
-        entry_coord = ttk.Entry(main_frame, textvariable=coord_var, width=20)
-        entry_coord.grid(row=r + 2, column=1, padx=4, pady=2)
+        ttk.Label(row_frame, text="좌표범위").grid(row=2, column=0, sticky=tk.W, pady=2)
+        entry_coord = ttk.Entry(row_frame, textvariable=coord_var, width=20)
+        entry_coord.grid(row=2, column=1, padx=4, pady=2, sticky=tk.W)
         if _EXCEL_COM_AVAILABLE:
             entry_coord.bind(
                 "<Double-Button-1>",
                 lambda e, k=wb_key, sv=sheet_var, rv=coord_var: open_range_picker_dialog(
-                    main_frame, k, rv, sv, "좌표 범위"
+                    row_frame, k, rv, sv, "좌표 범위"
                 ),
             )
-        ttk.Label(main_frame, text="수량범위").grid(row=r + 3, column=0, sticky=tk.W, pady=2)
-        entry_qty = ttk.Entry(main_frame, textvariable=qty_var, width=20)
-        entry_qty.grid(row=r + 3, column=1, padx=4, pady=2)
+        ttk.Label(row_frame, text="수량범위").grid(row=3, column=0, sticky=tk.W, pady=2)
+        entry_qty = ttk.Entry(row_frame, textvariable=qty_var, width=20)
+        entry_qty.grid(row=3, column=1, padx=4, pady=2, sticky=tk.W)
         if _EXCEL_COM_AVAILABLE:
             entry_qty.bind(
                 "<Double-Button-1>",
                 lambda e, k=wb_key, sv=sheet_var, rv=qty_var: open_range_picker_dialog(
-                    main_frame, k, rv, sv, "수량 범위"
+                    row_frame, k, rv, sv, "수량 범위"
                 ),
             )
 
-    bom_sheet_combo = ttk.Combobox(main_frame, textvariable=bom_sheet_var, width=20)
-    top_sheet_combo = ttk.Combobox(main_frame, textvariable=top_sheet_var, width=20)
-    bot_sheet_combo = ttk.Combobox(main_frame, textvariable=bot_sheet_var, width=20)
-    sheet_combos["bom"] = bom_sheet_combo
-    sheet_combos["top"] = top_sheet_combo
-    sheet_combos["bot"] = bot_sheet_combo
+    # ----- 단계별 UI 구성 -----
 
-    _grid_section(6, "BOM 시트", bom_sheet_combo, bom_sheet_var, bom_mat_var, bom_coord_var, bom_qty_var, "bom")
-    _grid_section(10, "TOP 시트", top_sheet_combo, top_sheet_var, top_mat_var, top_coord_var, top_qty_var, "top")
-    _grid_section(14, "BOT 시트", bot_sheet_combo, bot_sheet_var, bot_mat_var, bot_coord_var, bot_qty_var, "bot")
+    # 1단계: BOM
+    fr_bom = step_frames[1]
+    ttk.Label(fr_bom, text="1/4 단계 – BOM 파일/시트/범위 선택", font=("Segoe UI", 11, "bold")).pack(anchor=tk.W)
+    ttk.Label(fr_bom, text="BOM 정보가 들어 있는 파일과 범위를 선택하세요.").pack(anchor=tk.W, pady=(0, 8))
+    bom_inner = ttk.Frame(fr_bom)
+    bom_inner.pack(fill=tk.BOTH, expand=True)
+    _grid_section(bom_inner, "BOM 시트", bom_sheet_var, bom_mat_var, bom_coord_var, bom_qty_var, "bom")
+    btn_bom = ttk.Frame(fr_bom)
+    btn_bom.pack(fill=tk.X, pady=8)
+    ttk.Button(btn_bom, text="다음", command=lambda: (
+        messagebox.showerror("입력 오류", "BOM 파일을 선택해 주세요.") if not bom_path_var.get().strip()
+        else messagebox.showerror("입력 오류", "BOM 시트를 선택해 주세요.") if not bom_sheet_var.get().strip()
+        else show_step(2)
+    )).pack(side=tk.RIGHT, padx=4)
 
-    material_only_match_var = tk.BooleanVar(value=True)
+    # 2단계: TOP
+    fr_top = step_frames[2]
+    ttk.Label(fr_top, text="2/4 단계 – TOP 파일/시트/범위 선택", font=("Segoe UI", 11, "bold")).pack(anchor=tk.W)
+    ttk.Label(
+        fr_top,
+        text="TOP 면이 없는 프로젝트라면 아래 체크박스를 선택하고 건너뛸 수 있습니다.",
+    ).pack(anchor=tk.W, pady=(0, 8))
+    top_inner = ttk.Frame(fr_top)
+    top_inner.pack(fill=tk.BOTH, expand=True)
+    _grid_section(top_inner, "TOP 시트", top_sheet_var, top_mat_var, top_coord_var, top_qty_var, "top")
     ttk.Checkbutton(
-        main_frame,
+        top_inner,
+        text="이번 프로젝트는 TOP 면이 없습니다. (건너뛰기)",
+        variable=top_skip_var,
+    ).pack(anchor=tk.W, padx=4, pady=2)
+    btn_top = ttk.Frame(fr_top)
+    btn_top.pack(fill=tk.X, pady=8)
+
+    def _go_next_from_top() -> None:
+        if top_skip_var.get():
+            show_step(3)
+            return
+        if not top_path_var.get().strip():
+            messagebox.showerror("입력 오류", "TOP 파일을 선택하거나 'TOP 면이 없습니다'를 체크해 주세요.")
+            return
+        if not top_sheet_var.get().strip():
+            messagebox.showerror("입력 오류", "TOP 시트를 선택해 주세요.")
+            return
+        show_step(3)
+
+    ttk.Button(btn_top, text="이전", command=lambda: show_step(1)).pack(side=tk.LEFT, padx=4)
+    ttk.Button(btn_top, text="다음", command=_go_next_from_top).pack(side=tk.RIGHT, padx=4)
+
+    # 3단계: BOT
+    fr_bot = step_frames[3]
+    ttk.Label(fr_bot, text="3/4 단계 – BOT 파일/시트/범위 선택", font=("Segoe UI", 11, "bold")).pack(anchor=tk.W)
+    ttk.Label(
+        fr_bot,
+        text="BOT 면이 없는 프로젝트라면 아래 체크박스를 선택하고 건너뛸 수 있습니다.",
+    ).pack(anchor=tk.W, pady=(0, 8))
+    bot_inner = ttk.Frame(fr_bot)
+    bot_inner.pack(fill=tk.BOTH, expand=True)
+    _grid_section(bot_inner, "BOT 시트", bot_sheet_var, bot_mat_var, bot_coord_var, bot_qty_var, "bot")
+    ttk.Checkbutton(
+        bot_inner,
+        text="이번 프로젝트는 BOT 면이 없습니다. (건너뛰기)",
+        variable=bot_skip_var,
+    ).pack(anchor=tk.W, padx=4, pady=2)
+    btn_bot = ttk.Frame(fr_bot)
+    btn_bot.pack(fill=tk.X, pady=8)
+
+    def _go_next_from_bot() -> None:
+        if bot_skip_var.get():
+            if top_skip_var.get():
+                messagebox.showerror("입력 오류", "TOP과 BOT을 모두 건너뛸 수는 없습니다. 최소 하나는 사용해야 합니다.")
+                return
+            show_step(4)
+            return
+        if not bot_path_var.get().strip():
+            messagebox.showerror("입력 오류", "BOT 파일을 선택하거나 'BOT 면이 없습니다'를 체크해 주세요.")
+            return
+        if not bot_sheet_var.get().strip():
+            messagebox.showerror("입력 오류", "BOT 시트를 선택해 주세요.")
+            return
+        if top_skip_var.get() and not top_path_var.get().strip():
+            # 이 경우는 TOP 완전 미사용이므로 허용 (TOP 건너뛰기)
+            show_step(4)
+            return
+        show_step(4)
+
+    ttk.Button(btn_bot, text="이전", command=lambda: show_step(2)).pack(side=tk.LEFT, padx=4)
+    ttk.Button(btn_bot, text="다음", command=_go_next_from_bot).pack(side=tk.RIGHT, padx=4)
+
+    # 4단계: 요약 및 실행
+    fr_sum = step_frames[4]
+    ttk.Label(fr_sum, text="4/4 단계 – 설정 요약 및 매칭 실행", font=("Segoe UI", 11, "bold")).pack(anchor=tk.W)
+    ttk.Label(fr_sum, text="아래 설정을 확인한 뒤, 매칭 실행 버튼을 눌러 주세요.").pack(anchor=tk.W, pady=(0, 8))
+
+    summary_text = tk.Text(fr_sum, height=10, width=80, state="disabled")
+    summary_text.pack(fill=tk.BOTH, expand=False, pady=4)
+
+    def _refresh_summary() -> None:
+        summary_text.configure(state="normal")
+        summary_text.delete("1.0", tk.END)
+        def w(line: str) -> None:
+            summary_text.insert(tk.END, line + "\n")
+        w(f"BOM 파일: {bom_path_var.get().strip() or '-'}")
+        w(f"  시트: {bom_sheet_var.get().strip() or '-'}, 자재범위: {bom_mat_var.get().strip() or '-'}, 좌표범위: {bom_coord_var.get().strip() or '-'}, 수량범위: {bom_qty_var.get().strip() or '-'}")
+        w("")
+        w(f"TOP 사용 여부: {'없음' if top_skip_var.get() else '사용'}")
+        if not top_skip_var.get():
+            w(f"  파일: {top_path_var.get().strip() or '-'}")
+            w(f"  시트: {top_sheet_var.get().strip() or '-'}, 자재범위: {top_mat_var.get().strip() or '-'}, 좌표범위: {top_coord_var.get().strip() or '-'}, 수량범위: {top_qty_var.get().strip() or '-'}")
+        w("")
+        w(f"BOT 사용 여부: {'없음' if bot_skip_var.get() else '사용'}")
+        if not bot_skip_var.get():
+            w(f"  파일: {bot_path_var.get().strip() or '-'}")
+            w(f"  시트: {bot_sheet_var.get().strip() or '-'}, 자재범위: {bot_mat_var.get().strip() or '-'}, 좌표범위: {bot_coord_var.get().strip() or '-'}, 수량범위: {bot_qty_var.get().strip() or '-'}")
+        w("")
+        w(f"자재명 기준 매칭: {'예' if material_only_match_var.get() else '아니오'}")
+        w(f"좌표/자재 대소문자 무시: {'예' if case_insensitive_var.get() else '아니오'}")
+        w(f"저장 경로: {output_path_var.get().strip() or '(BOM과 같은 폴더에 _matched.xlsx)'}")
+        summary_text.configure(state="disabled")
+
+    option_frame = ttk.Frame(fr_sum)
+    option_frame.pack(fill=tk.X, pady=(4, 4))
+    ttk.Checkbutton(
+        option_frame,
         text="자재명 기준 매칭 (BOM 수량 vs TOP+BOT 총수량)",
         variable=material_only_match_var,
-    ).grid(row=18, column=0, columnspan=3, sticky=tk.W, pady=4)
-    case_insensitive_var = tk.BooleanVar(value=False)
+        command=_refresh_summary,
+    ).pack(anchor=tk.W)
     ttk.Checkbutton(
-        main_frame, text="좌표/자재 대소문자 무시", variable=case_insensitive_var
-    ).grid(row=19, column=0, columnspan=3, sticky=tk.W, pady=4)
+        option_frame,
+        text="좌표/자재 대소문자 무시",
+        variable=case_insensitive_var,
+        command=_refresh_summary,
+    ).pack(anchor=tk.W)
+
+    out_frame = ttk.Frame(fr_sum)
+    out_frame.pack(fill=tk.X, pady=(4, 4))
+    ttk.Label(out_frame, text="저장 경로 (비우면 BOM과 같은 폴더에 _matched.xlsx):").pack(anchor=tk.W)
+    sub = ttk.Frame(out_frame)
+    sub.pack(fill=tk.X)
+    ttk.Entry(sub, textvariable=output_path_var, width=50).pack(side=tk.LEFT, padx=(0, 4))
+    ttk.Button(sub, text="찾아보기", command=lambda: (browse_output(), _refresh_summary())).pack(side=tk.LEFT)
+
+    btn_sum = ttk.Frame(fr_sum)
+    btn_sum.pack(fill=tk.X, pady=8)
 
     def run_match_from_gui() -> None:
         bom_path = bom_path_var.get().strip()
         top_path = top_path_var.get().strip()
         bot_path = bot_path_var.get().strip()
-        if not bom_path or not top_path or not bot_path:
-            messagebox.showerror("입력 오류", "BOM, TOP, BOT 파일을 모두 선택해 주세요.")
+        if not bom_path:
+            messagebox.showerror("입력 오류", "BOM 파일을 선택해 주세요.")
             return
         if not bom_sheet_var.get().strip():
             messagebox.showerror("입력 오류", "BOM 시트를 선택해 주세요.")
             return
-        if not top_sheet_var.get().strip():
-            messagebox.showerror("입력 오류", "TOP 시트를 선택해 주세요.")
+        if top_skip_var.get() and bot_skip_var.get():
+            messagebox.showerror("입력 오류", "TOP과 BOT을 모두 건너뛸 수는 없습니다. 최소 하나는 사용해야 합니다.")
             return
-        if not bot_sheet_var.get().strip():
-            messagebox.showerror("입력 오류", "BOT 시트를 선택해 주세요.")
-            return
+        if not top_skip_var.get():
+            if not top_path:
+                messagebox.showerror("입력 오류", "TOP 파일을 선택하거나 'TOP 면이 없습니다'를 체크해 주세요.")
+                return
+            if not top_sheet_var.get().strip():
+                messagebox.showerror("입력 오류", "TOP 시트를 선택해 주세요.")
+                return
+        if not bot_skip_var.get():
+            if not bot_path:
+                messagebox.showerror("입력 오류", "BOT 파일을 선택하거나 'BOT 면이 없습니다'를 체크해 주세요.")
+                return
+            if not bot_sheet_var.get().strip():
+                messagebox.showerror("입력 오류", "BOT 시트를 선택해 주세요.")
+                return
         cfg = {
             "bom_file": bom_path,
-            "top_file": top_path,
-            "bot_file": bot_path,
+            "top_file": top_path if not top_skip_var.get() else None,
+            "bot_file": bot_path if not bot_skip_var.get() else None,
             "output_path": output_path_var.get().strip() or None,
             "bom": {
                 "sheet": bom_sheet_var.get().strip(),
@@ -916,6 +1138,8 @@ def run_gui() -> None:
                 "inplace": False,
                 "material_only_match": material_only_match_var.get(),
                 "case_insensitive": case_insensitive_var.get(),
+                "top_skipped": top_skip_var.get(),
+                "bot_skipped": bot_skip_var.get(),
             },
         }
         try:
@@ -931,9 +1155,12 @@ def run_gui() -> None:
                 )
             messagebox.showerror("오류", err_msg)
 
-    ttk.Button(main_frame, text="매칭 실행", command=run_match_from_gui).grid(
-        row=20, column=1, columnspan=2, pady=12
-    )
+    ttk.Button(btn_sum, text="이전", command=lambda: show_step(3)).pack(side=tk.LEFT, padx=4)
+    ttk.Button(btn_sum, text="매칭 실행", command=run_match_from_gui).pack(side=tk.RIGHT, padx=4)
+
+    # 초기 단계 및 요약 갱신
+    show_step(1)
+    _refresh_summary()
 
     root.mainloop()
 
